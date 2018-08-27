@@ -37,7 +37,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public TestFunctionHost(string appRoot,
             Action<IWebJobsBuilder> configureJobHost,
-            Action<IConfigurationBuilder> configureAppConfiguration = null)
+            Action<IConfigurationBuilder> configureAppConfiguration = null,
+            Action<IServiceCollection> configureServices = null)
         {
             _appRoot = appRoot;
 
@@ -53,6 +54,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var factory = new TestOptionsFactory<ScriptApplicationHostOptions>(_hostOptions);
             var optionsMonitor = new OptionsMonitor<ScriptApplicationHostOptions>(factory, Array.Empty<IOptionsChangeTokenSource<ScriptApplicationHostOptions>>(), factory);
             var builder = new WebHostBuilder()
+                .ConfigureLogging(b =>
+                {
+                    b.AddProvider(_loggerProvider);
+                })
                 .ConfigureServices(services =>
                   {
                       services.Replace(new ServiceDescriptor(typeof(ISecretManagerProvider), new TestSecretManagerProvider(new TestSecretManager())));
@@ -61,6 +66,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                       services.Replace(new ServiceDescriptor(typeof(IOptionsMonitor<ScriptApplicationHostOptions>), optionsMonitor));
 
                       services.AddSingleton<IConfigureBuilder<IConfigurationBuilder>>(_ => new DelegatedConfigureBuilder<IConfigurationBuilder>(configureAppConfiguration));
+
+                      configureServices?.Invoke(services);
                   })
                   .AddScriptHostBuilder(webJobsBuilder =>
                   {

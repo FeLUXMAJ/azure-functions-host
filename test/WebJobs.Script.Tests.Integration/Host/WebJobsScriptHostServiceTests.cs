@@ -1,9 +1,18 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license Informationrmation.
 
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.WebJobs.Host.Config;
+using Microsoft.Azure.WebJobs.Script.Scale;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -11,16 +20,9 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
+using Moq;
+using Newtonsoft.Json.Linq;
 using Xunit;
-using static Microsoft.Azure.WebJobs.Script.Tests.TestFunctionHost;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
 {
@@ -66,6 +68,96 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Host
 
             Assert.NotNull(sdkProvider);
             Assert.NotNull(scriptProvider);
+        }
+
+        [Fact]
+        public async Task HostHealthMonitor_TriggersShutdown_WhenHostUnhealthy()
+        {
+            string functionDir = Path.Combine(TestHelpers.FunctionsTestDirectory, "Functions", Guid.NewGuid().ToString());
+            Directory.CreateDirectory(functionDir);
+            string logDir = Path.Combine(TestHelpers.FunctionsTestDirectory, "Logs", Guid.NewGuid().ToString());
+
+            JObject hostConfig = new JObject
+            {
+                { "version", "2.0" },
+                { "id", "123456" }
+            };
+            File.WriteAllText(Path.Combine(functionDir, ScriptConstants.HostMetadataFileName), hostConfig.ToString());
+
+            // configure the monitor so it will fail within a couple seconds
+            var healthMonitorOptions = new HostHealthMonitorOptions
+            {
+                HealthCheckInterval = TimeSpan.FromMilliseconds(100),
+                HealthCheckWindow = TimeSpan.FromSeconds(1),
+                HealthCheckThreshold = 5
+            };
+            var wrappedHealthMonitorOptions = new OptionsWrapper<HostHealthMonitorOptions>(healthMonitorOptions);
+
+            var mockJobHostEnvironment = new Mock<IScriptJobHostEnvironment>(MockBehavior.Strict);
+            bool shutdownCalled = false;
+            mockJobHostEnvironment.Setup(p => p.Shutdown())
+                .Callback(() =>
+                {
+                    shutdownCalled = true;
+                });
+
+            var mockEnvironment = new Mock<IEnvironment>();
+            mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId)).Returns("testapp");
+
+            var mockHostPerformanceManager = new Mock<HostPerformanceManager>(mockEnvironment.Object, wrappedHealthMonitorOptions);
+
+            bool underHighLoad = false;
+            mockHostPerformanceManager.Setup(p => p.IsUnderHighLoad(It.IsAny<Collection<string>>(), It.IsAny<ILogger>()))
+                .Callback<Collection<string>, ILogger>((c, l) =>
+                {
+                    if (underHighLoad)
+                    {
+                        c.Add("Connections");
+                    }
+                })
+                .Returns(() => underHighLoad);
+
+            var host = new TestFunctionHost(functionDir, 
+                builder =>
+                {
+                    
+                },
+                builder =>
+                {
+                },
+                services =>
+                {
+                    services.AddSingleton<IOptions<HostHealthMonitorOptions>>(wrappedHealthMonitorOptions);
+                    services.AddSingleton<IScriptJobHostEnvironment>(mockJobHostEnvironment.Object);
+                    services.AddSingleton<IEnvironment>(mockEnvironment.Object);
+                    services.AddSingleton<HostPerformanceManager>(mockHostPerformanceManager.Object);
+                });
+
+            var hostService = host.JobHostServices.GetService<IScriptHostManager>() as WebJobsScriptHostService;
+            Assert.Equal(ScriptHostState.Running, hostService.State);
+
+            // now that host is running make host unhealthy and wait
+            // for host shutdown
+            underHighLoad = true;
+
+            await TestHelpers.Await(() => shutdownCalled);
+
+            Assert.Equal(ScriptHostState.Error, hostService.State);
+            mockJobHostEnvironment.Verify(p => p.Shutdown(), Times.Once);
+
+            // we expect a few restart iterations
+            var logMessages = host.GetLogMessages();
+            var thresholdErrors = logMessages.Where(p => p.Exception is InvalidOperationException && p.Exception.Message == "Host thresholds exceeded: [Connections]. For more information, see https://aka.ms/functions-thresholds.");
+            var count = thresholdErrors.Count();
+            Assert.True(count > 0);
+
+            var log = logMessages.First(p => p.FormattedMessage == "Host is unhealthy. Initiating a restart." && p.Level == LogLevel.Error);
+            Assert.Equal(LogLevel.Error, log.Level);
+
+            log = logMessages.First(p => p.FormattedMessage == "Host unhealthy count exceeds the threshold of 5 for time window 00:00:01. Initiating shutdown.");
+            Assert.Equal(LogLevel.Error, log.Level);
+
+            Assert.Contains(logMessages, p => p.FormattedMessage == "Stopping JobHost");
         }
 
         public class Fixture : IAsyncLifetime

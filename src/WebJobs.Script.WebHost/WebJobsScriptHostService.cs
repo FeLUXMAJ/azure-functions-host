@@ -2,12 +2,14 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Hosting;
 using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Azure.WebJobs.Script.Scale;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -20,15 +22,21 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         private readonly IServiceProvider _rootServiceProvider;
         private readonly IServiceScopeFactory _rootScopeFactory;
         private readonly IOptionsMonitor<ScriptApplicationHostOptions> _applicationHostOptions;
-        private readonly IScriptWebHostEnvironment _scriptWebHostEnvironment;
         private readonly ILogger _logger;
+        private readonly IEnvironment _environment;
+        private readonly HostPerformanceManager _performanceManager;
+        private readonly IOptions<HostHealthMonitorOptions> _healthMonitorOptions;
+        private readonly SlidingWindow<bool> _healthCheckWindow;
+        private readonly Timer _hostHealthCheckTimer;
+
         private IHost _host;
         private CancellationTokenSource _startupLoopTokenSource;
         private int _hostStartCount;
         private bool _disposed = false;
 
         public WebJobsScriptHostService(IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions, IServiceProvider rootServiceProvider,
-            IServiceScopeFactory rootScopeFactory, IScriptWebHostEnvironment scriptWebHostEnvironment, ILoggerFactory loggerFactory)
+            IServiceScopeFactory rootScopeFactory, ILoggerFactory loggerFactory, IEnvironment environment,
+            HostPerformanceManager hostPerformanceManager, IOptions<HostHealthMonitorOptions> healthMonitorOptions)
         {
             if (loggerFactory == null)
             {
@@ -38,11 +46,19 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             _rootServiceProvider = rootServiceProvider ?? throw new ArgumentNullException(nameof(rootServiceProvider));
             _rootScopeFactory = rootScopeFactory ?? throw new ArgumentNullException(nameof(rootScopeFactory));
             _applicationHostOptions = applicationHostOptions ?? throw new ArgumentNullException(nameof(applicationHostOptions));
-            _scriptWebHostEnvironment = scriptWebHostEnvironment ?? throw new ArgumentNullException(nameof(scriptWebHostEnvironment));
+            _environment = environment ?? throw new ArgumentNullException(nameof(environment));
+            _performanceManager = hostPerformanceManager ?? throw new ArgumentNullException(nameof(hostPerformanceManager));
+            _healthMonitorOptions = healthMonitorOptions ?? throw new ArgumentNullException(nameof(healthMonitorOptions));
 
             _logger = loggerFactory.CreateLogger(ScriptConstants.LogCategoryHostGeneral);
 
             State = ScriptHostState.Default;
+
+            if (ShouldMonitorHostHealth)
+            {
+                _healthCheckWindow = new SlidingWindow<bool>(_healthMonitorOptions.Value.HealthCheckWindow);
+                _hostHealthCheckTimer = new Timer(OnHostHealthCheckTimer, null, TimeSpan.Zero, _healthMonitorOptions.Value.HealthCheckInterval);
+            }
         }
 
         public IServiceProvider Services => _host?.Services;
@@ -50,6 +66,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         public ScriptHostState State { get; private set; }
 
         public Exception LastError { get; private set; }
+
+        /// <summary>
+        /// Gets a value indicating whether the host health monitor should be active.
+        /// </summary>
+        internal bool ShouldMonitorHostHealth
+        {
+            get
+            {
+                return _healthMonitorOptions.Value.Enabled && _environment.IsAppServiceEnvironment();
+            }
+        }
 
         public async Task StartAsync(CancellationToken cancellationToken)
         {
@@ -78,11 +105,22 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            ScriptHost scriptHost = null;
             try
             {
+                // if we were in an error state retain that,
+                // otherwise move to default
+                if (State != ScriptHostState.Error)
+                {
+                    State = ScriptHostState.Default;
+                }
+
                 bool isOffline = CheckAppOffline();
 
                 _host = BuildHost(isOffline, skipHostJsonConfiguration);
+
+                scriptHost = (ScriptHost)_host.Services.GetService<ScriptHost>();
+                scriptHost.HostInitializing += OnHostInitializing;
 
                 LogInitialization(_host, isOffline, attemptCount, _hostStartCount++);
 
@@ -110,17 +148,21 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 attemptCount++;
 
                 ILogger logger = GetHostLogger(_host);
+                logger.LogError(exc, "A host error has occurred");
 
-                logger.LogError(exc, "A ScriptHost error has occurred");
+                if (ShutdownHostIfUnhealthy())
+                {
+                    return;
+                }
 
                 var orphanTask = Orphan(_host, logger)
                     .ContinueWith(t =>
-                           {
-                               if (t.IsFaulted)
-                               {
-                                   t.Exception.Handle(e => true);
-                               }
-                           }, TaskContinuationOptions.ExecuteSynchronously);
+                        {
+                            if (t.IsFaulted)
+                            {
+                                t.Exception.Handle(e => true);
+                            }
+                        }, TaskContinuationOptions.ExecuteSynchronously);
 
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -176,7 +218,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             State = ScriptHostState.Default;
 
-            _logger.LogInformation("Restarting script host.");
+            _logger.LogInformation("Restarting host.");
 
             var previousHost = _host;
             Task startTask = StartAsync(cancellationToken);
@@ -184,7 +226,14 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             await startTask;
 
-            _logger.LogInformation("Script host restarted.");
+            _logger.LogInformation("Host restarted.");
+        }
+
+        private void OnHostInitializing(object sender, EventArgs e)
+        {
+            // we check host health before starting to avoid starting
+            // the host when connection or other issues exist
+            IsHostHealthy(throwWhenUnhealthy: true);
         }
 
         private IHost BuildHost(bool isOffline = false, bool skipHostJsonConfiguration = false)
@@ -222,7 +271,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         {
             var hostLoggerFactory = _host?.Services.GetService<ILoggerFactory>();
 
-            // Attempt to get the host loger with JobHost configuration applied
+            // Attempt to get the host logger with JobHost configuration applied
             // using the default logger as a fallback
             return hostLoggerFactory?.CreateLogger(LogCategories.Startup) ?? _logger;
         }
@@ -249,6 +298,61 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             return false;
         }
 
+        private void OnHostHealthCheckTimer(object state)
+        {
+            bool isHealthy = IsHostHealthy();
+            _healthCheckWindow.AddEvent(isHealthy);
+
+            if (!isHealthy && State == ScriptHostState.Running)
+            {
+                // This periodic check allows us to break out of the host run
+                // loop. The health check performed in OnHostInitializing will then
+                // fail and we'll enter a restart loop (exponentially backing off)
+                // until the host is healthy again and we can resume host processing.
+                var message = "Host is unhealthy. Initiating a restart.";
+                _logger.LogError(0, message);
+                var tIgnore = RestartHostAsync(CancellationToken.None);
+            }
+        }
+
+        internal bool IsHostHealthy(bool throwWhenUnhealthy = false)
+        {
+            if (!ShouldMonitorHostHealth)
+            {
+                return true;
+            }
+
+            var exceededCounters = new Collection<string>();
+            if (_performanceManager.IsUnderHighLoad(exceededCounters))
+            {
+                string formattedCounters = string.Join(", ", exceededCounters);
+                if (throwWhenUnhealthy)
+                {
+                    throw new InvalidOperationException($"Host thresholds exceeded: [{formattedCounters}]. For more information, see https://aka.ms/functions-thresholds.");
+                }
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool ShutdownHostIfUnhealthy()
+        {
+            if (ShouldMonitorHostHealth && _healthCheckWindow.GetEvents().Where(isHealthy => !isHealthy).Count() > _healthMonitorOptions.Value.HealthCheckThreshold)
+            {
+                // if the number of times the host has been unhealthy in
+                // the current time window exceeds the threshold, recover by
+                // initiating shutdown
+                var message = $"Host unhealthy count exceeds the threshold of {_healthMonitorOptions.Value.HealthCheckThreshold} for time window {_healthMonitorOptions.Value.HealthCheckWindow}. Initiating shutdown.";
+                _logger.LogError(0, message);
+                var environment = _rootServiceProvider.GetService<IScriptJobHostEnvironment>();
+                environment.Shutdown();
+                return true;
+            }
+
+            return false;
+        }
+
         /// <summary>
         /// Remove the <see cref="IHost"/> instance from the live instances collection,
         /// allowing it to finish currently executing functions before stopping and disposing of it.
@@ -256,13 +360,15 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         /// <param name="instance">The <see cref="IHost"/> instance to remove</param>
         private async Task Orphan(IHost instance, ILogger logger, CancellationToken cancellationToken = default)
         {
+            //instance.HostInitializing -= OnHostInitializing;
+
             try
             {
                 await (instance?.StopAsync(cancellationToken) ?? Task.CompletedTask);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                //  logger.LogTrace(exc, "Error stopping and disposing of host");
+                _logger.LogTrace(ex, "Error stopping and disposing of host");
             }
             finally
             {
